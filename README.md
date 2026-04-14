@@ -106,6 +106,8 @@ The FAISS index is built automatically on first run and saved to `movie_index/`.
 
 **Sriram K**
 
+**Suhaas D**
+
 ---
 
 ## 📝 License
