@@ -111,6 +111,7 @@ def get_movie_details(title):
 
 class AgentState(TypedDict):
     query: str
+    rewritten_query: str
     context: str
     response: str
     movie_titles: list
@@ -118,8 +119,17 @@ class AgentState(TypedDict):
     failed_movies: list
 
 
+def rewrite_query_node(state: AgentState) -> AgentState:
+    prompt = f""" You are an expert movie librarian. Extract the core semantic concepts, genres, and keywords from the user's query to optimize it for a vector database search. Remove conversational filter.
+
+User Query: {state["query"]}
+
+Output ONLY the optimized keywords as a single string. """
+    rewritten = llm.invoke(prompt).content.strip()
+    return {"rewritten_query": rewritten}
 
 def retrieve_local_node(state: AgentState) -> AgentState:
+    search_query = state.get("rewritten_query", state["query"])
     docs = retriever.invoke(state["query"])
     context = "\n\n".join([doc.page_content for doc in docs])
     return {"context": context}
@@ -128,20 +138,24 @@ def retrieve_local_node(state: AgentState) -> AgentState:
 def generate_node(state: AgentState) -> AgentState:
     prompt = f"""You are a movie recommendation assistant.
 
-Movies available:
+Movies available in the local database:
 {state["context"]}
 
 Request: {state["query"]}
+CRITICAL INSTRUCTION: You MUST ONLY recommend movies that are explicitly listed in the "Movies available" section above. Do NOT use outside knowledge. Do NOT hallucinate movies. If none of the available movies match the request (for example, if the user asks for a year not present in the data), return exactly: "NO_MATCH"
 
 Return ONLY a numbered list:
 1. Movie Name (Year) - one sentence reason
 2. Movie Name (Year) - one sentence reason
 
 Always include the release year in parentheses."""
+    response = llm.invoke(prompt).content.strip()
     return {"response": llm.invoke(prompt).content}
 
 
 def extract_titles_node(state: AgentState) -> AgentState:
+    if "NO_MATCH" in state["response"]:
+        return {"movie_titles": []}
     titles = []
 
     for line in state["response"].split("\n"):
@@ -159,12 +173,17 @@ def verify_node(state: AgentState) -> AgentState:
 
     checks = "\n".join([f'- "{t}"' for t in titles])
     prompt = f"""
-For each movie below, answer Yes or No if it matches "{state["query"]}".
+You are a strict, ruthless verification judge. Your job is to ensure the recommended movies PERFECTLY match the user's request.
+User Request: "{state["query"]}"
 
-Movies:
+Movies to verify:
 {checks}
 
-Format:
+Step 1: Think step-by-step. Does the movie explicitly meet the core constraints of the user's request? 
+Step 2: On a new line, output EXACTLY '"Movie Name": Yes' if it is a strong match, or '"Movie Name": No' if it is only a partial match, a weak connection, or completely irrelevant.
+
+Format exactly like this for each movie:
+Reasoning: [your brief reasoning]
 "Movie": Yes/No
 """
 
@@ -203,8 +222,18 @@ Rules:
 - Always include the release year in parentheses after the title
 - Only include real movie titles found in the results above
 - No commentary, no disclaimers, nothing after the list"""
-
-    return {"response": llm.invoke(prompt).content}
+    
+    response_content = llm.invoke(prompt).content
+    
+    # Extract titles directly in the fallback node ---
+    titles = []
+    for line in response_content.split("\n"):
+        match = re.match(r"\d+\.\s*(.*?)\s*-", line)
+        if match:
+            titles.append(match.group(1).strip())
+            
+    return {"response": response_content, "movie_titles": titles}
+    
 
 
 def verify_decision(state: AgentState):
@@ -216,14 +245,16 @@ def verify_decision(state: AgentState):
 def build_graph():
     graph = StateGraph(AgentState)
 
+    graph.add_node("rewrite_query", rewrite_query_node)
     graph.add_node("retrieve_local", retrieve_local_node)
     graph.add_node("generate", generate_node)
     graph.add_node("extract_titles", extract_titles_node)
     graph.add_node("verify", verify_node)
     graph.add_node("internet_fallback", internet_fallback_node)
 
-    graph.set_entry_point("retrieve_local")
+    graph.set_entry_point("rewrite_query")
 
+    graph.add_edge("rewrite_query","retrieve_local")
     graph.add_edge("retrieve_local", "generate")
     graph.add_edge("generate", "extract_titles")
     graph.add_edge("extract_titles", "verify")
@@ -281,3 +312,9 @@ if st.button("Recommend") and query:
         st.subheader("💬 Explanation")
         for line in explanation_lines:
             st.markdown(f"- {line}")
+
+    # Display the rewritten query so the user can see it in action
+    with st.expander("🔍 See Agent Pipeline Debug"):
+        st.write(f"**Original Query:** {result.get('query')}")
+        st.write(f"**Rewritten for FAISS:** {result.get('rewritten_query')}")
+        st.write(f"**Passed Local Verification?** {result.get('verified')}")
